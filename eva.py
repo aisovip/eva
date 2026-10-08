@@ -1,6 +1,9 @@
 ﻿import os, sys
 import re
 import json
+import time
+import random
+import http.client
 import subprocess
 import argparse
 import urllib.request
@@ -75,7 +78,95 @@ if not EVA_API_KEY:
     sys.exit(1)
 
 COMMON_HEADER = {"User-Agent": "EVA", "Authorization": f"Bearer {EVA_API_KEY}"}
+
+# ====================== LLM 重试配置区 ======================
+# 网络抖动、超时、限流（408/429）、服务端错误（5xx）与 400（端点偶发抽风）会自动退避重试；
+# 鉴权/路由类错误（401/403/404）不重试，直接抛出，避免无效重试拖慢反馈
+EVA_MAX_RETRY = 5               # 最大尝试次数
+EVA_RETRY_BASE = 1.0            # 首次退避等待（秒）
+EVA_RETRY_FACTOR = 4.0          # 退避倍数：每次等待 ×4
+EVA_RETRY_MAX_DELAY = 32.0      # 单次退避等待上限（秒）
+EVA_CONNECT_TIMEOUT = 10.0      # 建连/首字节等待上限（秒）
+EVA_READ_TIMEOUT = 300.0        # 读取/流式空闲超时（秒）
+
+class LLMError(Exception):
+    """不可重试的 LLM 调用错误（鉴权失败、请求非法、返回结构异常等）"""
+
+class LLMRetryError(Exception):
+    """重试若干次后仍然失败的 LLM 调用错误"""
+
+class _RetryableError(Exception):
+    """内部用：标记可重试的瞬时错误"""
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+def _retry_notice(attempt, total, err, delay):
+    # 仅在交互式终端提示，避免污染管道/机器人等非交互场景的输出
+    if sys.stderr.isatty():
+        sys.stderr.write(
+            f"\033[2m[EVA] LLM 调用异常（第 {attempt}/{total} 次）：{err}｜{delay:.1f}s 后重试…\033[0m\n"
+        )
+        sys.stderr.flush()
+
+def _backoff_delay(attempt, retry_after=None):
+    # 服务端给出 Retry-After 时优先遵循，否则指数退避 + 抖动，避免惊群
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), EVA_RETRY_MAX_DELAY)
+        except (TypeError, ValueError):
+            pass
+    delay = EVA_RETRY_BASE * (EVA_RETRY_FACTOR ** (attempt - 1)) + random.uniform(0, 0.5)
+    return min(delay, EVA_RETRY_MAX_DELAY)
+
+def _with_retry(fn, what="LLM 调用"):
+    """对 fn() 做指数退避重试：fn 内部把瞬时错误抛成 _RetryableError 即会被重试，
+    其它异常一律直接向上抛出（不重试）。总等待由「最大次数」与「单次退避上限」共同约束，
+    退避等待期间按 Ctrl+C 可中断。"""
+    last_err = None
+    attempts = 0
+    for attempt in range(1, EVA_MAX_RETRY + 1):
+        attempts = attempt
+        try:
+            return fn()
+        except _RetryableError as e:
+            last_err = e
+            if attempt >= EVA_MAX_RETRY:
+                break
+            delay = _backoff_delay(attempt, e.retry_after)
+            _retry_notice(attempt, EVA_MAX_RETRY, e, delay)
+            time.sleep(delay)
+    raise LLMRetryError(f"{what}失败，已尝试 {attempts} 次：{last_err}")
+
+def _open_llm(req, timeout):
+    """发起 LLM HTTP 请求，把错误分类为可重试（_RetryableError）或不可重试（LLMError）。"""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace')
+        # 400 也纳入重试：端点偶发抽风会返回 400，重试通常可恢复；
+        # 401/403/404 属鉴权/路由问题，重试无意义，直接抛出。
+        if e.code in (400, 408, 429) or 500 <= e.code < 600:
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            raise _RetryableError(f"HTTP {e.code}: {raw[:300]}", retry_after=retry_after)
+        raise LLMError(f"HTTP {e.code}: {raw[:500]}")
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        raise _RetryableError(f"网络错误：{e}")
+
+def _set_socket_timeout(resp, timeout):
+    """建连完成后，把底层 socket 的超时从 connect 超时放开为 read 超时。
+    这样连接阶段快速失败、流式阶段则用更宽松的空闲超时（看门狗）。
+    依赖 CPython 标准库的内部结构，失败时静默保持原超时，不影响功能。"""
+    try:
+        sock = resp.fp.raw._sock
+        if hasattr(sock, "settimeout"):
+            sock.settimeout(timeout)
+    except Exception:
+        pass
+
 def detect_model_len():
+    # 启动期端点探测：必须快速失败，【不做任何重试】——不经过 _with_retry / _open_llm。
+    # 配置类问题（Key/URL/模型名不对）重试无意义，只会拖慢启动；这里只用一次请求 + 明确报错。
     url = f"{EVA_BASE_URL}/models"
     req = urllib.request.Request(url, headers=COMMON_HEADER)
     try:
@@ -474,17 +565,26 @@ def llm_chat(messages, tools=None, temperature=0.6, thinking=True):
         url, data=body,
         headers={**COMMON_HEADER, "Content-Type": "application/json"}
     )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            out = json.loads(resp.read().decode('utf-8', errors='replace'))
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode('utf-8', errors='replace')
-        raise Exception(f"HTTP {e.code}: {raw}")
 
+    def _once():
+        resp = _open_llm(req, EVA_READ_TIMEOUT)  # 非流式：整体用 read 超时（生成先于响应头，不能设短）
+        try:
+            raw = resp.read().decode('utf-8', errors='replace')
+        except (http.client.HTTPException, OSError) as e:
+            raise _RetryableError(f"读取响应失败：{e}")
+        finally:
+            resp.close()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            # 响应体被截断等导致的非法 JSON，多为瞬时问题，可重试
+            raise _RetryableError(f"返回非法 JSON（{len(raw)} 字节）：{str(e)}")
+
+    out = _with_retry(_once)
     try:
         return out["choices"][0]["message"], out['usage']
     except Exception as e:
-        raise Exception(f"LLM调用失败，错误信息：{e}, {out}")
+        raise LLMError(f"LLM 返回结构异常：{e}, {str(out)[:300]}")
 
 class ThinkRepeatError(Exception):
     pass
@@ -523,106 +623,129 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
         url, data=body,
         headers={**COMMON_HEADER, "Content-Type": "application/json"}
     )
-    try:
-        resp = urllib.request.urlopen(req)
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode('utf-8', errors='replace')
-        raise Exception(f"LLM调用失败，HTTP {e.code}: {raw[:500]}")
 
-    # 累积变量
+    # 累积变量（重试时会整体重置）
     content_parts = []
     reasoning_parts = []
     tool_calls_map = {}  # index -> {id, type, function: {name, arguments}}
     usage = None
     role = "assistant"
     is_thinking = False
+    had_think = False
 
     # 正文模式：rich可用且为终端时，缓冲到结束一次性Markdown渲染（表格对齐，不污染滚动缓冲）；
     # 否则逐块流式输出
     buffer_mode = HAS_RICH and RICH_CONSOLE.is_terminal
-    had_think = False
 
     detector = RepeatSuffixChecker(min_unit_len=400)
 
-    try:
-        for raw_line in resp:
-            line = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
-            if not line:
-                continue
-            if not line.startswith('data: '):
-                continue
-            payload = line[6:]
-            if payload.strip() == '[DONE]':
-                break
+    def _reset():
+        nonlocal content_parts, reasoning_parts, tool_calls_map, usage
+        nonlocal role, is_thinking, had_think, detector
+        content_parts = []
+        reasoning_parts = []
+        tool_calls_map = {}
+        usage = None
+        role = "assistant"
+        is_thinking = False
+        had_think = False
+        detector = RepeatSuffixChecker(min_unit_len=400)
 
-            try:
-                chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+    def _emitted():
+        # 是否已向用户输出过可见内容（think 是实时输出的；正文在 buffer 模式下尚未输出）
+        return had_think or bool(content_parts) or bool(reasoning_parts) or bool(tool_calls_map)
 
-            # 提取 usage（最后一个 chunk 带 usage）
-            if 'usage' in chunk and chunk['usage']:
-                usage = chunk['usage']
+    def _once():
+        nonlocal usage, role, is_thinking, had_think
+        _reset()
+        resp = _open_llm(req, EVA_CONNECT_TIMEOUT)   # 流式：首字节很快返回，用较短的 connect 超时
+        _set_socket_timeout(resp, EVA_READ_TIMEOUT)  # 建连后放开为 read 超时（流式空闲看门狗）
+        try:
+            for raw_line in resp:
+                line = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
+                if not line:
+                    continue
+                if not line.startswith('data: '):
+                    continue
+                payload = line[6:]
+                if payload.strip() == '[DONE]':
+                    break
 
-            choices = chunk.get('choices', [])
-            if not choices:
-                continue
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
 
-            delta = choices[0].get('delta', {})
-            if not delta:
-                continue
+                # 提取 usage（最后一个 chunk 带 usage）
+                if 'usage' in chunk and chunk['usage']:
+                    usage = chunk['usage']
 
-            role = delta.get('role') or role
+                choices = chunk.get('choices', [])
+                if not choices:
+                    continue
 
-            # ---- reasoning / thinking 内容 ----
-            reasoning_content = delta.get('reasoning_content') or delta.get('reasoning') or ''
-            if reasoning_content:
-                had_think = True
-                if not is_thinking:
-                    is_thinking = True
-                    _think_start()  # 暗色显示思考过程
-                _stream_write(reasoning_content, style="dim italic")  # rich下每个print独立，需逐段带样式
-                reasoning_parts.append(reasoning_content)
-                for c in reasoning_content:
-                    if detector.add_char(c):
-                        raise ThinkRepeatError()
+                delta = choices[0].get('delta', {})
+                if not delta:
+                    continue
 
-            # ---- 正文内容 ----
-            text = delta.get('content') or ''
-            if text:
-                if is_thinking:
-                    is_thinking = False
-                    _think_end()  # 结束暗色
-                content_parts.append(text)
-                if not buffer_mode:  # 非rich终端环境：逐块流式
-                    _stream_write(text)
+                role = delta.get('role') or role
 
-            # ---- tool_calls 增量 ----
-            if 'tool_calls' in delta and delta['tool_calls']:
-                for tc_delta in delta['tool_calls']:
-                    idx = tc_delta.get('index', 0)
-                    if idx not in tool_calls_map:
-                        tool_calls_map[idx] = {
-                            'id': tc_delta.get('id', ''),
-                            'type': 'function',
-                            'function': {'name': '', 'arguments': ''}
-                        }
-                    tc_entry = tool_calls_map[idx]
-                    if tc_delta.get('id'):
-                        tc_entry['id'] = tc_delta['id']
-                    func_delta = tc_delta.get('function', {})
-                    if func_delta.get('name'):
-                        tc_entry['function']['name'] += func_delta['name']
-                    if func_delta.get('arguments'):
-                        tc_entry['function']['arguments'] += func_delta['arguments']
-    finally:
-        resp.close()
-        if is_thinking:
-            _think_end()
-        if buffer_mode and content_parts:
-            if not had_think:  # 无think时先换行，避免正文贴在 [*] EVA: 后
-                RICH_CONSOLE.print()
-            RICH_CONSOLE.print(Markdown(''.join(content_parts)))  # 一次性渲染，表格自动对齐
+                # ---- reasoning / thinking 内容 ----
+                reasoning_content = delta.get('reasoning_content') or delta.get('reasoning') or ''
+                if reasoning_content:
+                    had_think = True
+                    if not is_thinking:
+                        is_thinking = True
+                        _think_start()  # 暗色显示思考过程
+                    _stream_write(reasoning_content, style="dim italic")  # rich下每个print独立，需逐段带样式
+                    reasoning_parts.append(reasoning_content)
+                    for c in reasoning_content:
+                        if detector.add_char(c):
+                            raise ThinkRepeatError()
+
+                # ---- 正文内容 ----
+                text = delta.get('content') or ''
+                if text:
+                    if is_thinking:
+                        is_thinking = False
+                        _think_end()  # 结束暗色
+                    content_parts.append(text)
+                    if not buffer_mode:  # 非rich终端环境：逐块流式
+                        _stream_write(text)
+
+                # ---- tool_calls 增量 ----
+                if 'tool_calls' in delta and delta['tool_calls']:
+                    for tc_delta in delta['tool_calls']:
+                        idx = tc_delta.get('index', 0)
+                        if idx not in tool_calls_map:
+                            tool_calls_map[idx] = {
+                                'id': tc_delta.get('id', ''),
+                                'type': 'function',
+                                'function': {'name': '', 'arguments': ''}
+                            }
+                        tc_entry = tool_calls_map[idx]
+                        if tc_delta.get('id'):
+                            tc_entry['id'] = tc_delta['id']
+                        func_delta = tc_delta.get('function', {})
+                        if func_delta.get('name'):
+                            tc_entry['function']['name'] += func_delta['name']
+                        if func_delta.get('arguments'):
+                            tc_entry['function']['arguments'] += func_delta['arguments']
+        except (http.client.HTTPException, OSError) as e:
+            # 流式传输中断：仅在尚未输出任何内容时才重试，避免重复输出
+            if _emitted():
+                raise LLMError(f"流式响应中断（已有部分输出，不再重试）：{e}")
+            raise _RetryableError(f"流式响应中断：{e}")
+        finally:
+            resp.close()
+            if is_thinking:
+                _think_end()
+            if buffer_mode and content_parts:
+                if not had_think:  # 无think时先换行，避免正文贴在 [*] EVA: 后
+                    RICH_CONSOLE.print()
+                RICH_CONSOLE.print(Markdown(''.join(content_parts)))  # 一次性渲染，表格自动对齐
+
+    _with_retry(_once)
 
     # 组装最终 message（与非流式返回格式一致）
     full_content = ''.join(content_parts)
@@ -766,6 +889,7 @@ def _detect_malformed_tool_call(content: str):
 def agent_single_loop():
     global COMPACT_PANIC, LAST_USAGE
     break_loop = False
+    finished = False  # 本轮 turn 是否正常结束（模型给出了文字回复）；异常/中断时为 False
     while not break_loop:
         try:
             sys.stdout.write("\n[*] EVA: ")
@@ -797,6 +921,7 @@ def agent_single_loop():
                 if _detect_malformed_tool_call(content):
                     messages.append({"role": "user", "content": "警告：工具调用格式不正确，请重新以正确的格式调用 run_cli 工具。"})
                     continue
+                finished = True
                 break  # 有文字回复，正常结束
 
             for tc in msg['tool_calls']:
@@ -865,6 +990,7 @@ def agent_single_loop():
         except Exception as e:
             print(f"LLM 调用异常：{e}")
             break
+    return finished
 
 # ====================== 主循环 ======================
 def human_loop(user_ask=None, save_after=False, goal=False):
@@ -882,7 +1008,10 @@ def human_loop(user_ask=None, save_after=False, goal=False):
             display_usage(LAST_USAGE, TOKEN_CAP)
             if user_ask:
                 while True:
-                    agent_single_loop()
+                    if not agent_single_loop():
+                        # 已重试仍失败、或本轮被中断：中止 goal 任务，避免死循环空转发请求
+                        print("LLM 调用失败或已中断，goal 任务中止")
+                        break
                     msg = messages[-1]
                     if not goal or (msg.get('role') == 'assistant' and GOAL_MARKER in msg.get('content', '')):
                         break
