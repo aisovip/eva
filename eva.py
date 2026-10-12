@@ -80,8 +80,6 @@ if not EVA_API_KEY:
 COMMON_HEADER = {"User-Agent": "EVA", "Authorization": f"Bearer {EVA_API_KEY}"}
 
 # ====================== LLM 重试配置区 ======================
-# 网络抖动、超时、限流（408/429）、服务端错误（5xx）与 400（端点偶发抽风）会自动退避重试；
-# 鉴权/路由类错误（401/403/404）不重试，直接抛出，避免无效重试拖慢反馈
 EVA_MAX_RETRY = 5               # 最大尝试次数
 EVA_RETRY_BASE = 1.0            # 首次退避等待（秒）
 EVA_RETRY_FACTOR = 4.0          # 退避倍数：每次等待 ×4
@@ -155,7 +153,7 @@ def _open_llm(req, timeout):
 
 def _set_socket_timeout(resp, timeout):
     """建连完成后，把底层 socket 的超时从 connect 超时放开为 read 超时。
-    这样连接阶段快速失败、流式阶段则用更宽松的空闲超时（看门狗）。
+这样连接阶段快速失败、流式阶段则用更宽松的空闲超时（看门狗）。
     依赖 CPython 标准库的内部结构，失败时静默保持原超时，不影响功能。"""
     try:
         sock = resp.fp.raw._sock
@@ -165,8 +163,6 @@ def _set_socket_timeout(resp, timeout):
         pass
 
 def detect_model_len():
-    # 启动期端点探测：必须快速失败，【不做任何重试】——不经过 _with_retry / _open_llm。
-    # 配置类问题（Key/URL/模型名不对）重试无意义，只会拖慢启动；这里只用一次请求 + 明确报错。
     url = f"{EVA_BASE_URL}/models"
     req = urllib.request.Request(url, headers=COMMON_HEADER)
     try:
@@ -199,7 +195,7 @@ def detect_model_len():
     for d in out['data']:
         if d['id'] == EVA_MODEL_NAME:
             return d.get("max_model_len", {
-                "deepseek-v4-flash": 1_000_000,
+                "deepseek-flash": 1_000_000,
                 "deepseek-v4-pro": 1_000_000,
             }.get(EVA_MODEL_NAME, 256_000))
     print(f"错误：在 {EVA_BASE_URL} 上未找到模型 '{EVA_MODEL_NAME}'，请检查 EVA_MODEL_NAME 配置。")
@@ -462,7 +458,6 @@ def run_cli(command: str, timeout: int = 300):
             output += f"\nSTDERR:\n{result.stderr}"
         return output.strip() or "(no output)"
     except Exception as e:
-
         return f"执行失败：{str(e)}"
 
 def _trim_tool_content(msg):
@@ -633,10 +628,8 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
     is_thinking = False
     had_think = False
 
-    # 正文模式：rich可用且为终端时，缓冲到结束一次性Markdown渲染（表格对齐，不污染滚动缓冲）；
-    # 否则逐块流式输出
+    # 正文模式：rich可用且为终端时，缓冲到结束一次性Markdown渲染（表格对齐，不污染滚动缓冲）；否则逐块流式输出
     buffer_mode = HAS_RICH and RICH_CONSOLE.is_terminal
-
     detector = RepeatSuffixChecker(min_unit_len=400)
 
     def _reset():
